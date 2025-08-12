@@ -84,6 +84,146 @@ bivariate_data_4yr <- data.frame(MASS::mvrnorm(n=1e6,
   mutate(SL = EQ*Elong,
          Index = "4year")
 
+#
+# Determine the distribution for subset EQ and Elong
+#
+SKU <- "Snack Pack"
+applesPerPack <- 2
+ElongIncrement <- 0.01
+EQAnchor <- 62
+UpperLower <- "U"
+EQIncrement <- 0.1
+
+
+SKUHeight <- function(ElongIncrement,EQIncrement,EQAnchor,UpperLower,ApplesPerPack,AppleStats) {
+  
+  mu <- c(AppleStats[[1,1]], AppleStats[[1,3]])
+  
+  sigma <- matrix(c(AppleStats[[1,2]]^2, AppleStats[[1,5]], AppleStats[[1,5]], AppleStats[[1,4]]^2), 
+                       nrow=2, byrow=T)
+  
+  if (UpperLower == "U") {
+  
+    lower_bounds <- c(EQAnchor-EQIncrement, AppleStats[[1,3]]-ElongIncrement)
+    upper_bounds <- c(EQAnchor, AppleStats[[1,3]]+ElongIncrement)
+    
+  } else {
+    
+    lower_bounds <- c(EQAnchor, AppleStats[[1,3]]-ElongIncrement)
+    upper_bounds <- c(EQAnchor+EQIncrement, AppleStats[[1,3]]+ElongIncrement)
+    
+  }
+  
+  n_samples <- ApplesPerPack
+  
+  temp_cw <- replicate(n = 1000, expr = {
+    x_i <- as_tibble(tmvtnorm::rtmvnorm(n = n_samples, 
+                                        mean = mu, 
+                                        sigma = sigma, 
+                                        lower = lower_bounds, 
+                                        upper = upper_bounds),
+                     .name_repair = "unique_quiet") |>
+      rename(EQ = ...1,
+             Elong = ...2) |>
+      mutate(SL = Elong*EQ) |>
+      pull(SL)
+    sum(x_i)
+  })
+  
+  # Calculate the probability of the truncated data set
+  
+  prob <- mvtnorm::pmvnorm(lower = lower_bounds, upper = upper_bounds, mean = mu, sigma = sigma)
+  
+  cw <- as_tibble_col(temp_cw, column_name = "TubeHeights") |>
+    summarise(meanHeight = mean(TubeHeights),
+              sdHeight = sd(TubeHeights)) |>
+    mutate(EQIncrement = EQIncrement,
+           ElongIncrement = ElongIncrement,
+           maxHeight1000 = qnorm(0.001, mean=meanHeight, sd=sdHeight, lower.tail = F),
+           maxHeight10000 = qnorm(0.0001, mean=meanHeight, sd=sdHeight, lower.tail = F),
+           Width1000 = maxHeight1000-meanHeight,
+           Width10000 = maxHeight10000-meanHeight,
+           PropDist = prob[[1]])
+  
+  return(cw)
+}
+  
+SKUHeight(ElongIncrement,EQIncrement,EQAnchor,UpperLower,applesPerPack,AppleStats4YearMean)
+
+input_grid <- expand_grid(EQ = seq(0.1,4.0,0.1), Elong = seq(0.01,0.11,0.01))
+
+DistTest <- map2(input_grid$Elong,input_grid$EQ, ~SKUHeight(.x,.y,EQAnchor,UpperLower,applesPerPack,AppleStats4YearMean)) |>
+  bind_rows()
+
+DTWide <- DistTest |>
+  pivot_wider(id_cols = EQIncrement,
+              names_from = ElongIncrement,
+              values_from = PropDist) |>
+  column_to_rownames(var = "EQIncrement") 
+
+DTWide_Mat <- DTWide |>
+  as.matrix()
+
+library(plotly)
+
+Y <- seq(0.1,4.0,0.1)
+X <- seq(0.01,0.11,0.01)
+
+plot_ly() %>%
+  add_surface(x = ~X, y = ~Y, z = ~DTWide_Mat)
+
+#1D model for fill height variation
+
+model1D <- lm(ElongIncrement~Width1000, data = DistTest |> filter(EQIncrement == 2.0))
+  
+summary(model1D)
+
+ELIMax <- predict(model1D, newdata = tibble(Width1000 = 10))
+
+#2D Model for relative distribution
+
+model2D <- rsm(PropDist ~ SO(EQIncrement,ElongIncrement), data = DistTest)
+
+summary(model2D)
+
+#Specify the proportion required
+K <- 0.36
+
+
+
+IntersecFunction <- function(x, K, model) {
+  
+  A <- summary(model)$coef[[6]]
+  B <- summary(model)$coef[[4]]
+  C <- summary(model)$coef[[5]]
+  D <- summary(model)$coef[[3]]
+  E <- summary(model)$coef[[2]]
+  F <- summary(model)$coef[[1]]-K
+  
+  alpha <- (B^2)-(4*A*C)
+  beta <- (2*B*E)-(4*C*D)
+  gamma <- (E^2)-(4*C*F)
+  
+  y <- (-(B*x+E)+sqrt(alpha*x^2+beta*x+gamma))/(2*C)
+  #y <- (-(B*x+E)-sqrt(alpha*x^2+beta*x+gamma))/(2*C)
+  
+  return(y)
+}  
+
+x <- seq(.01,0.11,0.01)
+
+EQIMax <- IntersecFunction(ELIMax, 0.36, model2D)
+
+DistCurve <- x |>
+  map_dbl(~IntersecFunction(.,0.07,model2D)) |>
+  as_tibble() |>
+  bind_cols(tibble(ElongIncrement = x)) |>
+  rename(EQIncrement = value)
+
+DistCurve |>
+  ggplot(aes(x = ElongIncrement, y = EQIncrement)) +
+  geom_point() +
+  geom_line()
 
 bivariate_data_4yr |>
   ggplot(aes(x=Elong, y=EQ, groups = Index)) +
@@ -91,138 +231,31 @@ bivariate_data_4yr |>
   scale_fill_continuous(type = "viridis") +
   geom_hline(yintercept = AppleStats4YearMean[[1,1]], linewidth = 1) +
   geom_vline(xintercept = AppleStats4YearMean[[1,3]], linewidth = 1) +
+  annotate("rect", 
+           xmin = AppleStats4YearMean[[1,3]]-ELIMax,
+           xmax = AppleStats4YearMean[[1,3]]+ELIMax,
+           ymin = 62-EQIMax,
+           ymax = 62,
+           colour = "#a9342c",
+           fill = "#a9342c",
+           alpha = 0.5) +
   theme_bw()
 
-# Initial subset
 
-ElongMin <- AppleStats4YearMean[[1,3]]-0.05
-ElongMax <- AppleStats4YearMean[[1,3]]+0.05
-EQMin <- AppleStats4YearMean[[1,1]]-2.5
-EQMax <- AppleStats4YearMean[[1,1]]+2.5
+SKUHeight(ELIMax,EQIMax,EQAnchor,UpperLower,applesPerPack,AppleStats4YearMean)
 
-SP_BV_Data <- bivariate_data_4yr |>
-  filter(Elong > ElongMin & Elong < ElongMax,
-         EQ > EQMin & EQ < EQMax) |>
-  mutate(SL = Elong*EQ)
-
-SP_BV_Data |>
-  ggplot(aes(SL)) +
-  geom_histogram()
- 
-#
-# Determine the distribution for subset EQ and Elong
-#
-SKU <- "Snack Pack"
-applesPerPack <- 2
-width <- seq(0.01,0.11,0.01)
-
-SKUHeight <- function(ElongIncrement, AppleStats4YearMean, bivariate_data_4yr) {
-  
-  SP_BV_Data <- bivariate_data_4yr |>
-# Subset the distribution into the SKU range 
-    filter(Elong > AppleStats4YearMean[[1,3]]-ElongIncrement & Elong < AppleStats4YearMean[[1,3]]+ElongIncrement,
-           EQ > AppleStats4YearMean[[1,1]]-2.5 & EQ < AppleStats4YearMean[[1,1]]+2.5) |>
-# convert Elongation to apple height
-    mutate(SL = Elong*EQ)
-  
-  SL_data <- SP_BV_Data |>
-    pull(SL)
-  
-  distr <- propagate::fitDistr(SL_data, verbose = F)
-  
-  params <- data.table::transpose(enframe(distr$par[[1]])) |>
-    janitor::row_to_names(1) |>
-    mutate(distribution = distr$stat$Distribution[[1]])
-  
-  if(params$distribution == "4P Beta") {
-    
-    temp_cw <- replicate(n = 100000, expr = {
-      x_i = ExtDist::rBeta_ab(applesPerPack, 
-                              shape1 = as.numeric(params[[1,1]]),
-                              shape2 = as.numeric(params[[1,2]]),
-                              a = as.numeric(params[[1,3]]),
-                              b = as.numeric(params[[1,4]]))
-      sum(x_i)
-    })
-    
-  } else if (params$distribution == "Johnson SB") {
-    
-    temp_cw <- replicate(n = 100000, expr = {
-      x_i = ExtDist::rJohnsonSB(applesPerPack, 
-                                gamma = params[[1,5]],
-                                delta = params[[1,6]],
-                                xi = params[[1,3]],
-                                lambda = params[[1,4]])
-      sum(x_i)
-    })
-    
-  }
-  
-}
-
-SKUHeight(0.02,AppleStats4YearMean,bivariate_data_4yr)
-
-distTest <- width |>
-  map(~SKUHeight(.,AppleStats4YearMean,bivariate_data_4yr))
-  
+SKU <- "Hero Small"
+applesPerPack <- 5
+ElongIncrement <- 0.01
+EQAnchor <- 62-EQIMax
+UpperLower <- "U"
+EQIncrement <- 0.1
 
 
 
 
-SL_data <- SP_BV_Data |>
-  pull(SL)
 
-distr <- propagate::fitDistr(SL_data, verbose = F)
 
-params <- data.table::transpose(enframe(distr$par[[1]])) |>
-  janitor::row_to_names(1)
-
-output1 <- tibble(distribution = distr$stat$Distribution[[1]]) |>
-  bind_cols(params)
-
-output2 <- MCSimulation(applesPerPack, output1)
-
-temp_cw <- replicate(n = 100000, expr = {
-  x_i = ExtDist::rBeta_ab(applesPerPack, 
-                          shape1 = as.numeric(params[[1,1]]),
-                          shape2 = as.numeric(params[[1,2]]),
-                          a = as.numeric(params[[1,3]]),
-                          b = as.numeric(params[[1,4]]))
-  sum(x_i)
-})
-
-cw <- as_tibble_col(temp_cw, column_name = "TubeHeights") |>
-  summarise(meanHeight = mean(TubeHeights),
-            sdHeight = sd(TubeHeights)) |>
-  mutate(maxHeight1000 = qnorm(0.001, mean=meanHeight, sd=sdHeight, lower.tail = F),
-         maxHeight10000 = qnorm(0.0001, mean=meanHeight, sd=sdHeight, lower.tail = F),
-         maxHeight100000 = qnorm(0.00001, mean=meanHeight, sd=sdHeight, lower.tail = F),
-         Width1000 = maxHeight1000-meanHeight,
-         Width10000 = maxHeight10000-meanHeight,
-         Width100000 = maxHeight100000-meanHeight)
-
-minPackHeight <- function(applesPerPack, mean, sd) {
-  # replicate the filling of 1,000,000 packs
-  temp_cw <- replicate(n = 1000000, expr = {
-    x_i = rnorm(applesPerPack, mean, sd)
-    sum(x_i)
-  })
-  # calculate the mean and standard dev for each set of 1,000,000 packs
-  # then calculate P[X<x] = 0.001 and P[X<x] = 0.0001 
-  cw <- as_tibble_col(temp_cw, column_name = "AppleHeights") |>
-    summarise(meanHeight = mean(AppleHeights),
-              sdHeight = sd(AppleHeights)) |>
-    mutate(maxHeight1000 = qnorm(0.001, mean=meanHeight, sd=sdHeight, lower.tail = F),
-           maxHeight10000 = qnorm(0.0001, mean=meanHeight, sd=sdHeight, lower.tail = F),
-           maxHeight100000 = qnorm(0.00001, mean=meanHeight, sd=sdHeight, lower.tail = F),
-           applesPerPack = {{applesPerPack}})
-  
-  return(cw)
-}
-
-minPackHeight(5,SKUPop6753yr_stats[[1,1]],SKUPop6753yr_stats[[1,2]])
-
-minPackHeight(5,SKUPop6752025_stats[[1,1]],SKUPop6752025_stats[[1,2]])
 
 
 
